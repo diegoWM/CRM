@@ -16,8 +16,8 @@ logger = logging_client.logger('crm_data_pipeline')
 # Constants
 PROJECT_ID = 'weedme-379116'
 BUCKET_NAME = 'ez_focus_crm'
-DATASET_ID = 'crm_data'
-ACCOUNTS_TABLE = 'accounts'
+DATASET_ID = 'WM_SalesTeam'
+ACCOUNTS_TABLE = 'Accounts_List'
 
 # API Configuration
 API_CONFIG = {
@@ -32,7 +32,7 @@ API_CONFIG = {
 }
 CREDENTIALS = {
     'username': 'dcardenas',
-    'password': 'diego4456'
+    'password': 'diego$456'
 }
 
 @retry(tries=3, delay=5, backoff=2)
@@ -73,9 +73,10 @@ def process_accounts_data(data):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').astype(dtype)
     
-    # Add processing timestamp
+    # Add processing timestamp - formatted for BigQuery compatibility
     montreal_tz = pytz.timezone('America/Montreal')
-    df['etl_timestamp'] = datetime.now(montreal_tz)
+    # Using ISO format with timezone info for BigQuery compatibility
+    df['load_timestamp'] = datetime.now(montreal_tz)
     
     # Ensure consistent column names - map to standardized names
     column_mapping = {
@@ -158,46 +159,62 @@ def save_to_gcs(data, prefix):
 
 def load_to_bigquery(df, table_name):
     """Load processed data to BigQuery"""
-    client = bigquery.Client()
-    table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
-    
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_APPEND",
-        schema_update_options=[
-            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
-        ],
-        # Define schema to ensure consistent data types
-        schema=[
-            bigquery.SchemaField("store_id", "INTEGER"),
-            bigquery.SchemaField("store_name", "STRING"),
-            bigquery.SchemaField("address", "STRING"),
-            bigquery.SchemaField("city", "STRING"),
-            bigquery.SchemaField("province", "STRING"),
-            bigquery.SchemaField("postal_code", "STRING"),
-            bigquery.SchemaField("latitude", "FLOAT"),
-            bigquery.SchemaField("longitude", "FLOAT"),
-            bigquery.SchemaField("email", "STRING"),
-            bigquery.SchemaField("phone", "STRING"),
-            bigquery.SchemaField("accnt_class", "STRING"),
-            bigquery.SchemaField("accnt_type", "STRING"),
-            bigquery.SchemaField("chain_group", "STRING"),
-            bigquery.SchemaField("client_since", "DATE"),
-            bigquery.SchemaField("client_until", "DATE"),
-            bigquery.SchemaField("NAT_KEY", "STRING"),
-            bigquery.SchemaField("rep_name", "STRING"),
-            bigquery.SchemaField("etl_timestamp", "TIMESTAMP")
-        ]
-    )
-    
-    job = client.load_table_from_dataframe(
-        df,
-        table_id,
-        job_config=job_config
-    )
-    job.result()  # Wait for the job to complete
-    
-    logger.info(f"Data loaded to BigQuery: {table_id}")
-    
-    # Log row count for monitoring
-    table = client.get_table(table_id)
-    logger.info(f"Total rows in table after load: {table.num_rows}") 
+    try:
+        client = bigquery.Client()
+        table_id = f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+        
+        # Make a copy of the dataframe to avoid modifying the original
+        upload_df = df.copy()
+        
+        # Print sample data for debugging
+        logger.info(f"DataFrame sample before processing:\n{upload_df.head(2)}")
+        logger.info(f"Original data types: {upload_df.dtypes}")
+        
+        # CRITICAL FIX: Convert problematic columns to strings to avoid PyArrow conversion errors
+        for col in ['store_id', 'accnt_no']:
+            if col in upload_df.columns:
+                upload_df[col] = upload_df[col].astype(str)
+                logger.info(f"Explicitly converted {col} to string type")
+        
+        # Let BigQuery auto-detect schema, which is safer than specifying types
+        job_config = bigquery.LoadJobConfig(
+            write_disposition="WRITE_TRUNCATE",
+            autodetect=True  # Let BigQuery infer schema
+        )
+        
+        logger.info(f"Loading {len(upload_df)} rows to BigQuery table {table_id}")
+        
+        try:
+            job = client.load_table_from_dataframe(
+                upload_df,
+                table_id,
+                job_config=job_config
+            )
+            
+            # Wait for the job to complete and check for errors
+            result = job.result()  
+            
+            if job.error_result:
+                error_msg = f"BigQuery job had errors: {job.error_result}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+                
+            logger.info(f"BigQuery job {job.job_id} completed successfully with {job.output_rows} rows")
+            
+            # Verify data was loaded
+            table = client.get_table(table_id)
+            logger.info(f"VERIFICATION: Table now has {table.num_rows} total rows")
+            
+            return True
+            
+        except Exception as load_error:
+            error_msg = f"Failed to load data to BigQuery: {str(load_error)}"
+            logger.error(error_msg)
+            logger.error(f"Error type: {type(load_error)}")
+            raise RuntimeError(error_msg)
+            
+    except Exception as e:
+        error_msg = f"BigQuery operation failed: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Error type: {type(e)}")
+        raise RuntimeError(error_msg) 
