@@ -1,3 +1,6 @@
+# CRM Data Pipeline - Cloud Run Service
+# Last updated: CI/CD Pipeline Test
+
 import os
 import logging
 from datetime import datetime
